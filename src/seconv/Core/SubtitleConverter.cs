@@ -320,6 +320,22 @@ internal class SubtitleConverter
             return false;
         }
 
+        if (ext == ".idx")
+        {
+            // Accept the .idx of a VobSub pair as input (5.0.0 did): redirect to the
+            // companion .sub and use this .idx for timing + palette (issue #12772).
+            var subPath = Path.ChangeExtension(inputFile, ".sub");
+            if (!File.Exists(subPath))
+            {
+                throw new InvalidOperationException(
+                    $"VobSub '.idx' input has no companion '.sub' ({Path.GetFileName(subPath)}) — "
+                    + "the .idx only holds timing and palette; the subtitle images live in the .sub.");
+            }
+
+            return await PassThroughSingleStreamAsync(subPath, options, result, fileIndex,
+                () => BitmapSubtitleLoader.LoadVobSub(subPath, inputFile, isPal: true));
+        }
+
         if (ext is ".mkv" or ".mks")
         {
             return await PassThroughMatroskaPgsAsync(inputFile, options, result, fileIndex);
@@ -393,40 +409,48 @@ internal class SubtitleConverter
             return false;
         }
 
-        var pgsTracks = matroska.GetTracks(true)
-            .Where(t => t.CodecId.Equals("S_HDMV/PGS", StringComparison.OrdinalIgnoreCase))
+        // Both bitmap track kinds are eligible for image-to-image: PGS, and VobSub (whose
+        // subpictures previously fell through to the OCR pipeline and were re-rasterised as
+        // text at the default font — issue #12772 part 3).
+        var bitmapTracks = matroska.GetTracks(true)
+            .Where(t => t.CodecId.Equals("S_HDMV/PGS", StringComparison.OrdinalIgnoreCase)
+                        || t.CodecId.Equals("S_VOBSUB", StringComparison.OrdinalIgnoreCase))
             .Where(t => !options.ForcedOnly || t.IsForced)
             .Where(t => options.TrackNumbers.Count == 0 || options.TrackNumbers.Contains(t.TrackNumber))
             .ToList();
 
-        if (pgsTracks.Count == 0)
+        if (bitmapTracks.Count == 0)
         {
-            // MKV has no PGS tracks usable for image-to-image; fall through so the regular
+            // MKV has no bitmap tracks usable for image-to-image; fall through so the regular
             // container loader can handle text tracks / OCR-friendly tracks.
             return false;
         }
 
-        if (pgsTracks.Count > 1 && !string.IsNullOrEmpty(options.OutputFilename))
+        if (bitmapTracks.Count > 1 && !string.IsNullOrEmpty(options.OutputFilename))
         {
             throw new InvalidOperationException(
                 "--output-filename can only target a single track. Use --track-number to select one.");
         }
 
-        foreach (var track in pgsTracks)
+        foreach (var track in bitmapTracks)
         {
+            var isVobSub = track.CodecId.Equals("S_VOBSUB", StringComparison.OrdinalIgnoreCase);
             var outputFile = ResolveOutputFileName(
                 inputFile, options, ContainerSubtitleLoader.SanitizeLang(track.Language), track.TrackNumber);
 
             if (!options.Quiet)
             {
                 var trackLabel = $"#{track.TrackNumber} ";
-                AnsiConsole.MarkupInterpolated($"[dim]{fileIndex}:[/] [cyan]{Path.GetFileName(inputFile)}[/] [yellow]{trackLabel}[/][dim](PGS img→img)→[/] [green]{outputFile}[/]...");
+                var kind = isVobSub ? "VobSub" : "PGS";
+                AnsiConsole.MarkupInterpolated($"[dim]{fileIndex}:[/] [cyan]{Path.GetFileName(inputFile)}[/] [yellow]{trackLabel}[/][dim]({kind} img→img)→[/] [green]{outputFile}[/]...");
             }
 
             IReadOnlyList<BitmapSubtitleLoader.BitmapSubtitleItem>? items = null;
             try
             {
-                items = BitmapSubtitleLoader.LoadMatroskaPgs(matroska, track);
+                items = isVobSub
+                    ? BitmapSubtitleLoader.LoadMatroskaVobSub(matroska, track)
+                    : BitmapSubtitleLoader.LoadMatroskaPgs(matroska, track);
                 WritePreservedBitmaps(items, outputFile, options);
                 result.SuccessfulFiles++;
                 result.Files.Add(new FileConversionResult(inputFile, outputFile, true, null));
@@ -907,7 +931,7 @@ internal record class ConversionOptions
 
     /// <summary>
     /// VobSub OCR only: before recognition, rebuild each subpicture as a crisp black-on-white
-    /// bitmap using histogram-based colour isolation — the most frequent opaque colour (the
+    /// bitmap using histogram-based colour isolation — the innermost colour plane (the
     /// glyph fill) becomes black and the outline / anti-alias tiers collapse into the white
     /// background. Improves recognition on discs whose gray outlines otherwise melt adjacent
     /// characters together. On by default; disable with <c>--no-vobsub-isolate-colors</c> to

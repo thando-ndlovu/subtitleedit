@@ -88,16 +88,53 @@ internal static class BitmapSubtitleLoader
         var screenHeight = isPal ? 576 : 480;
 
         var items = new List<BitmapSubtitleItem>(packs.Count);
+        var skipped = 0;
         foreach (var pack in packs)
         {
+            // Without the .idx CLUT, SubPicture.GetBitmap skips both the SetColor and
+            // SetContrast (per-plane alpha) display commands, so normally-transparent
+            // outline/anti-alias planes render opaque and fuse into the glyphs — the
+            // garbled OCR in issue #12772 ('-'→'=', 'S'→'$'). Mirrors the GUI, which
+            // always passes VobSubParser.IdxPalette.
+            if (parser.IdxPalette.Count > 0)
+            {
+                pack.Palette = parser.IdxPalette;
+            }
+
             var bmp = pack.GetBitmap();
             if (bmp is null)
             {
+                skipped++;
                 continue;
             }
-            items.Add(new BitmapSubtitleItem(pack.StartTimeCode, pack.EndTimeCode, bmp, screenWidth, screenHeight));
+
+            // Use the EndTime *property*, not EndTimeCode: many discs omit the subpicture's
+            // own delay command, so EndTimeCode is start + 0 (issue #12772 part 3: 740 of
+            // 1115 zero-duration cues in the .sup export). MergeVobSubPacks has already
+            // repaired EndTime for missing/negative/over-long delays — the same times the
+            // GUI shows.
+            items.Add(new BitmapSubtitleItem(
+                new TimeCode(pack.StartTime.TotalMilliseconds),
+                new TimeCode(pack.EndTime.TotalMilliseconds),
+                bmp,
+                screenWidth,
+                screenHeight));
         }
+        WarnSkippedBitmaps(skipped, "VobSub");
         return items;
+    }
+
+    /// <summary>
+    /// Issue #12772 part 3: undecodable subpictures used to vanish silently, making the
+    /// output look like it had fewer subtitles than the GUI sees. Surface the count.
+    /// </summary>
+    private static void WarnSkippedBitmaps(int skipped, string what)
+    {
+        if (skipped > 0)
+        {
+            Spectre.Console.AnsiConsole.MarkupLine(
+                $"[yellow]Note: {skipped} {what} subpicture(s) could not be decoded to a bitmap and were dropped.[/]");
+        }
     }
 
     /// <summary>
@@ -136,6 +173,13 @@ internal static class BitmapSubtitleLoader
                 $"VobSub MKV track #{track.TrackNumber} is compressed (content encoding 1), which isn't supported.");
         }
 
+        // The track's CodecPrivate holds the .idx text, including the CLUT palette. Without
+        // it SubPicture.GetBitmap skips SetColor/SetContrast and renders normally-transparent
+        // planes opaque (issue #12772) — same fix as LoadVobSub; mirrors the GUI MKV path.
+        var codecPrivate = track.GetCodecPrivate();
+        var palette = GetVobSubIdxPalette(codecPrivate);
+        var (screenWidth, screenHeight) = GetVobSubIdxScreenSize(codecPrivate);
+
         var sub = matroska.GetSubtitle(track.TrackNumber, null);
         var packs = new List<VobSubMergedPack>(sub.Count);
         foreach (var p in sub)
@@ -143,6 +187,7 @@ internal static class BitmapSubtitleLoader
             packs.Add(new VobSubMergedPack(p.GetData(track), TimeSpan.FromMilliseconds(p.Start), 32, null)
             {
                 EndTime = TimeSpan.FromMilliseconds(p.End),
+                Palette = palette,
             });
 
             // Fix overlapping time codes (some Handbrake versions emit them) by clamping the
@@ -154,25 +199,72 @@ internal static class BitmapSubtitleLoader
         }
 
         var items = new List<BitmapSubtitleItem>(packs.Count);
+        var skipped = 0;
         foreach (var pack in packs)
         {
             var bmp = pack.GetBitmap();
             if (bmp is null)
             {
+                skipped++;
                 continue;
             }
             // Use the block-derived Start/End (TimeSpan), not StartTimeCode/EndTimeCode which
             // are based on the SubPicture delay and only correct for .sub+.idx sources.
+            // Screen size comes from the CodecPrivate "size:" line so an image output
+            // (e.g. bluraysup) keeps the DVD frame instead of defaulting to 1920x1080.
             items.Add(new BitmapSubtitleItem(
                 new TimeCode(pack.StartTime.TotalMilliseconds),
                 new TimeCode(pack.EndTime.TotalMilliseconds),
-                bmp));
+                bmp,
+                screenWidth,
+                screenHeight));
         }
+        WarnSkippedBitmaps(skipped, "MKV VobSub");
         if (items.Count == 0)
         {
             throw new InvalidOperationException($"No VobSub subtitles in MKV track #{track.TrackNumber}.");
         }
         return items;
+    }
+
+    /// <summary>
+    /// Video frame size from a Matroska VobSub track's CodecPrivate .idx text ("size: 720x576"),
+    /// or the DVD PAL default when the line is missing or malformed.
+    /// </summary>
+    internal static (int Width, int Height) GetVobSubIdxScreenSize(string? codecPrivate)
+    {
+        if (!string.IsNullOrWhiteSpace(codecPrivate))
+        {
+            foreach (var line in codecPrivate.SplitToLines())
+            {
+                if (line.StartsWith("size:", StringComparison.OrdinalIgnoreCase))
+                {
+                    var parts = line.Substring(5).Trim().Split('x');
+                    if (parts.Length == 2 &&
+                        int.TryParse(parts[0].Trim(), out var w) && w > 0 &&
+                        int.TryParse(parts[1].Trim(), out var h) && h > 0)
+                    {
+                        return (w, h);
+                    }
+                }
+            }
+        }
+        return (720, 576);
+    }
+
+    /// <summary>
+    /// Palette (CLUT) from a Matroska VobSub track's CodecPrivate .idx text, or null when the
+    /// track carries none — <see cref="SubPicture.GetBitmap"/> then falls back to its defaults.
+    /// </summary>
+    internal static List<SKColor>? GetVobSubIdxPalette(string? codecPrivate)
+    {
+        if (string.IsNullOrWhiteSpace(codecPrivate))
+        {
+            return null;
+        }
+
+        var palette = new Idx(codecPrivate.SplitToLines()).Palette;
+        return palette.Count > 0 ? palette : null;
     }
 
     /// <summary>

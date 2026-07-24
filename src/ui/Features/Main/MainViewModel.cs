@@ -10943,7 +10943,7 @@ public partial class MainViewModel :
         var result =
             await ShowDialogAsync<ShowHistoryWindow, ShowHistoryViewModel>(vm => { vm.Initialize(_undoRedoManager); });
 
-        if (result.OkPressed && result.SelectedHistoryItem != null && result.SelectedHistoryItem.Hash != GetFastHash())
+        if (result.OkPressed && result.SelectedHistoryItem != null && result.SelectedHistoryItem.Hash != GetUndoRedoHash())
         {
             var undoCount = _undoRedoManager.UndoCount;
             for (var i = 0; i < undoCount; i++)
@@ -15155,7 +15155,7 @@ public partial class MainViewModel :
         return new UndoRedoItem(
             description,
             Subtitles.Select(p => new SubtitleLineViewModel(p)).ToArray(),
-            GetFastHash(),
+            GetUndoRedoHash(),
             _subtitleFileName,
             [SelectedSubtitleIndex ?? 0],
             1,
@@ -18947,6 +18947,26 @@ public partial class MainViewModel :
         return false;
     }
 
+    // Hash used by undo change detection. Undo snapshots capture and restore OriginalText,
+    // so the hash must cover the original too - with only GetFastHash, loading or editing an
+    // original never produced an undo entry, and the first Ctrl+Z restored a pre-load
+    // snapshot, wiping the whole original column (#12786). Save-tracking still uses
+    // GetFastHash/GetFastHashOriginal separately.
+    int IUndoRedoClient.GetFastHash() => GetUndoRedoHash();
+
+    public int GetUndoRedoHash()
+    {
+        if (!Dispatcher.UIThread.CheckAccess())
+        {
+            return Dispatcher.UIThread.Invoke(GetUndoRedoHash);
+        }
+
+        unchecked
+        {
+            return GetFastHash() * 31 + GetFastHashOriginal();
+        }
+    }
+
     public int GetFastHash()
     {
         // The undo change-detection timer calls this from a thread pool thread, and the loop below
@@ -19757,15 +19777,26 @@ public partial class MainViewModel :
             return;
         }
 
-        // Insert spell check items at the beginning of the menu
+        // Insert spell check items at the top of the menu, but below the ASSA Styles/Actors
+        // items when those are shown - they should stay first (#11744).
         var insertIndex = 0;
+        if (AreAssaContentMenuItemsVisible && MenuItemActors != null)
+        {
+            var actorsIndex = flyout.Items.IndexOf(MenuItemActors);
+            if (actorsIndex >= 0)
+            {
+                insertIndex = actorsIndex + 2; // after the Actors item and its separator
+            }
+        }
 
+        var hasMisspelledWords = false;
         var cell = pointerArgs == null ? null : GetSubtitleGridSpellCheckCell(pointerArgs);
         if (cell != null)
         {
             var (line, isOriginal) = cell.Value;
             var text = isOriginal ? line.OriginalText : line.Text;
             var words = GetMisspelledWords(text);
+            hasMisspelledWords = words.Count > 0;
 
             if (words.Count == 1)
             {
@@ -19804,10 +19835,21 @@ public partial class MainViewModel :
             Tag = "SpellCheck"
         };
         changeDictionary.Click += (_, _) => { CommandPickLiveSpellCheckDictionary(); };
-        flyout.Items.Insert(insertIndex++, changeDictionary);
 
-        // Add separator after spell check items
-        flyout.Items.Insert(insertIndex, new Separator { Tag = "SpellCheck" });
+        if (hasMisspelledWords)
+        {
+            flyout.Items.Insert(insertIndex++, changeDictionary);
+
+            // Add separator after spell check items
+            flyout.Items.Insert(insertIndex, new Separator { Tag = "SpellCheck" });
+        }
+        else
+        {
+            // No misspelling context for the click, so don't hoist the dictionary picker to the
+            // top of the menu - park it at the bottom instead (#11744).
+            flyout.Items.Add(new Separator { Tag = "SpellCheck" });
+            flyout.Items.Add(changeDictionary);
+        }
     }
 
     /// <summary>
